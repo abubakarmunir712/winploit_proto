@@ -1,7 +1,8 @@
 [package]
-name = "abubakar"
+name = "winploit_proto"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 dirs = "5.0"
+rand = "0.9.1"
